@@ -1,143 +1,208 @@
-# Credit Risk Alternative Data Project
+# Credit Risk Prediction Model
+
+An end-to-end machine learning system for predicting credit risk using alternative data from eCommerce transactions. This project implements a complete MLOps pipeline including feature engineering, model training, MLflow tracking, containerized deployment, and CI/CD automation.
+
+## Features
+
+- **Feature Engineering**: Automated pipeline with RFM analysis, temporal features, categorical encoding, and WoE transformation
+- **Proxy Target Creation**: RFM-based customer segmentation using K-Means clustering to identify high-risk customers
+- **Model Training**: Multiple algorithms (Logistic Regression, Decision Tree, Random Forest, XGBoost, LightGBM) with hyperparameter tuning
+- **Experiment Tracking**: MLflow integration for model versioning, metrics tracking, and model registry
+- **REST API**: FastAPI-based prediction service with automatic model loading from MLflow registry
+- **Containerization**: Docker and docker-compose setup for easy deployment
+- **CI/CD Pipeline**: Automated testing, linting, and Docker image building on every push
 
 ## Project Structure
 
 ```
-├── .github/workflows/ci.yml   # For CI/CD
-├── data/                       # Data folder (in .gitignore)
-│   ├── raw/                   # Raw data goes here 
-│   └── processed/             # Processed data for training
+├── .github/workflows/ci.yml   # CI/CD pipeline
+├── data/                       # Data directory (gitignored)
+│   ├── raw/                   # Raw transaction data
+│   └── processed/             # Processed features and targets
 ├── notebooks/
-│   └── eda.ipynb          # Exploratory, one-off analysis
+│   └── eda.ipynb              # Exploratory data analysis
 ├── src/
-│   ├── __init__.py
-│   ├── data_processing.py     # Script for feature engineering
-│   ├── train.py               # Script for model training
-│   ├── predict.py             # Script for inference
+│   ├── data_processing.py     # Feature engineering pipeline
+│   ├── target_engineering.py  # Proxy target variable creation
+│   ├── train.py               # Model training with MLflow
+│   ├── predict.py             # Inference utilities
 │   └── api/
 │       ├── main.py            # FastAPI application
-│       └── pydantic_models.py # Pydantic models for API
+│       └── pydantic_models.py # API request/response models
 ├── tests/
 │   └── test_data_processing.py # Unit tests
-├── Dockerfile
-├── docker-compose.yml
-├── requirements.txt
-├── .gitignore
+├── Dockerfile                 # Container configuration
+├── docker-compose.yml         # Multi-service orchestration
+├── requirements.txt          # Python dependencies
 └── README.md
 ```
 
-## Credit Scoring Business Understanding
+## Installation
 
-### 1. Basel II Accord's Emphasis on Risk Measurement and Model Interpretability
+### Prerequisites
 
-The Basel II Capital Accord fundamentally transformed banking regulation by requiring financial institutions to measure and manage credit risk through quantitative models. This regulatory framework emphasizes three key pillars: minimum capital requirements, supervisory review, and market discipline. Under Pillar 1, banks must calculate risk-weighted assets using either standardized approaches or Internal Ratings-Based (IRB) approaches, which rely heavily on credit scoring models.
+- Python 3.12+
+- Docker and Docker Compose (for containerized deployment)
 
-**Why Interpretability and Documentation Matter:**
+### Setup
 
-- **Regulatory Compliance**: Basel II requires banks to demonstrate that their models are sound, well-validated, and appropriately calibrated. Regulators need to understand how models work to assess capital adequacy and ensure the bank can withstand potential losses.
+1. Clone the repository:
+```bash
+git clone https://github.com/weldie10/credit-risk-alternative-data.git
+cd credit-risk-alternative-data
+```
 
-- **Model Validation**: The Accord mandates rigorous model validation processes. Interpretable models allow validators to verify that the model's logic aligns with business understanding and that risk factors are appropriately weighted.
+2. Create virtual environment and install dependencies:
+```bash
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
 
-- **Capital Allocation**: Since credit risk models directly influence capital requirements, regulators and internal stakeholders must be able to trace how model outputs translate to capital reserves. Black-box models create opacity that undermines confidence in capital calculations.
+3. Download data and place in `data/raw/` directory
 
-- **Audit Trail**: In a regulated environment, every decision must be explainable. Interpretable models provide clear reasoning for credit decisions, which is essential for regulatory audits, customer disputes, and internal governance.
+## Usage
 
-- **Risk Management**: Senior management and risk committees need to understand model behavior to make informed strategic decisions. Interpretable models enable risk managers to identify concentration risks, understand model limitations, and adjust lending policies accordingly.
+### 1. Exploratory Data Analysis
 
-### 2. Necessity of Proxy Variables and Associated Business Risks
+```bash
+jupyter notebook notebooks/eda.ipynb
+```
 
-**Why Proxy Variables Are Necessary:**
+### 2. Feature Engineering
 
-In this project, we lack direct historical default data because:
-- The eCommerce platform is new and doesn't have traditional credit history
-- There's no existing loan performance data to label customers as "defaulted" or "non-defaulted"
-- We're working with alternative data (transactional behavior) rather than traditional credit bureau data
+```python
+from src.data_processing import FeatureEngineeringPipeline
 
-**Creating a Proxy Variable:**
+pipeline = FeatureEngineeringPipeline(
+    customer_id_col='CustomerId',
+    amount_col='Amount',
+    datetime_col='TransactionStartTime',
+    scaling_method='standardize'
+)
 
-We must construct a proxy for credit risk using available behavioral data. The RFM (Recency, Frequency, Monetary) framework provides a foundation:
-- **Recency**: How recently a customer made a transaction (recent activity may indicate engagement)
-- **Frequency**: How often transactions occur (consistent behavior may indicate reliability)
-- **Monetary**: Transaction values (spending patterns may indicate financial capacity)
+df_processed = pipeline.fit_transform(df)
+```
 
-Additionally, we can leverage:
-- Fraud indicators (FraudResult) as a signal of risky behavior
-- Payment patterns and transaction consistency
-- Product category preferences and channel usage patterns
+### 3. Create Proxy Target Variable
 
-**Potential Business Risks of Proxy-Based Predictions:**
+```python
+from src.target_engineering import create_proxy_target
 
-1. **Proxy Risk**: The proxy variable may not accurately capture true credit risk. Behavioral patterns in eCommerce may not translate directly to loan repayment behavior. A customer who frequently makes small purchases might be low-risk for eCommerce but high-risk for larger loans.
+df_with_target = create_proxy_target(
+    df,
+    customer_id_col='CustomerId',
+    amount_col='Amount',
+    datetime_col='TransactionStartTime',
+    n_clusters=3,
+    random_state=42
+)
+```
 
-2. **Model Drift**: As the business evolves, the relationship between the proxy and actual credit risk may change. The model needs continuous monitoring and recalibration.
+### 4. Train Models
 
-3. **Regulatory Scrutiny**: Regulators may question the validity of proxy-based models, especially if they cannot establish a clear link between the proxy and actual default behavior. This could lead to higher capital requirements or model rejection.
+```bash
+python src/train.py \
+    --data-path data/processed/data_with_target.csv \
+    --target-column is_high_risk \
+    --models XGBoost LightGBM RandomForest \
+    --register-model credit-risk-model
+```
 
-4. **False Positives/Negatives**: Misclassification can have significant financial impact:
-   - **False Negatives** (approving bad customers): Direct financial losses from defaults
-   - **False Positives** (rejecting good customers): Lost revenue opportunities and potential discrimination concerns
+### 5. Make Predictions
 
-5. **Data Quality Dependencies**: Proxy variables depend on data quality and completeness. Missing or erroneous transaction data could lead to incorrect risk assessments.
+```python
+from src.predict import Predictor
 
-6. **Conceptual Mismatch**: eCommerce transaction behavior may not fully capture factors relevant to credit risk (e.g., income stability, existing debt obligations, financial planning).
+predictor = Predictor("models/model_xgboost.joblib")
+predictions, probabilities = predictor.predict(X, return_proba=True)
+```
 
-**Mitigation Strategies:**
-- Extensive validation using holdout samples and out-of-time testing
-- Establishing clear business rules that complement the model
-- Continuous monitoring of model performance and proxy variable relevance
-- Building relationships with traditional credit bureaus for validation when possible
-- Implementing conservative risk thresholds initially, with gradual refinement
+## API Deployment
 
-### 3. Trade-offs: Simple Interpretable Models vs. Complex High-Performance Models
+### Using Docker Compose
 
-**Simple, Interpretable Models (e.g., Logistic Regression with WoE)**
+```bash
+# Set environment variables
+export MLFLOW_MODEL_NAME=credit-risk-model
+export MLFLOW_MODEL_STAGE=Production
 
-**Advantages:**
-- **Regulatory Acceptance**: Easier to get regulatory approval. Regulators can understand and validate the model logic.
-- **Transparency**: Each feature's contribution is clear and explainable. Credit decisions can be traced to specific factors.
-- **Stability**: Less prone to overfitting and more stable across different data distributions.
-- **Business Alignment**: Coefficients and weights align with business intuition, making it easier for stakeholders to accept and use.
-- **Debugging**: When models fail, it's easier to identify which features or assumptions are problematic.
-- **Compliance**: Meets requirements for explainable AI/ML in financial services (e.g., GDPR right to explanation, fair lending requirements).
+# Start API service
+docker-compose up api
+```
 
-**Disadvantages:**
-- **Performance Limitations**: May not capture complex non-linear relationships and feature interactions as effectively as ensemble methods.
-- **Feature Engineering Dependency**: Requires extensive manual feature engineering (e.g., WoE transformation) to achieve good performance.
-- **Lower Predictive Power**: In complex scenarios with many interacting factors, simpler models may have lower AUC/accuracy.
+The API will be available at `http://localhost:8000`
 
-**Complex High-Performance Models (e.g., Gradient Boosting, XGBoost, LightGBM)**
+### API Endpoints
 
-**Advantages:**
-- **Superior Performance**: Often achieve higher AUC scores and better predictive accuracy by capturing complex patterns and interactions.
-- **Automatic Feature Engineering**: Can discover non-linear relationships and interactions without extensive manual engineering.
-- **Robustness**: Better handling of missing values and outliers through built-in mechanisms.
-- **Competitive Advantage**: In a competitive market, better risk discrimination can lead to more profitable lending decisions.
+- `GET /` - API information
+- `GET /health` - Health check
+- `POST /predict` - Single prediction
+- `POST /predict/batch` - Batch predictions
+- `POST /load_model` - Load model from MLflow registry
+- `GET /model/info` - Model information
+- `GET /docs` - Interactive API documentation
 
-**Disadvantages:**
-- **Regulatory Challenges**: "Black box" nature makes regulatory approval more difficult. Regulators may require extensive documentation and validation.
-- **Interpretability Trade-offs**: While tools like SHAP exist, the model's decision logic is less transparent than linear models.
-- **Overfitting Risk**: Complex models may overfit to training data, leading to poor generalization.
-- **Operational Complexity**: Harder to implement business rules, adjust for policy changes, and explain to non-technical stakeholders.
-- **Compliance Concerns**: May struggle to meet explainability requirements for customer-facing decisions.
+### Example API Request
 
-**Recommended Approach for This Project:**
+```bash
+curl -X POST "http://localhost:8000/predict" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "features": {
+      "Amount": 1000.0,
+      "Value": 1000.0,
+      "transaction_frequency": 5.0,
+      "avg_transaction_amount": 200.0
+    }
+  }'
+```
 
-Given the regulatory context and business requirements, a **hybrid approach** is recommended:
+## Testing
 
-1. **Primary Model**: Start with a well-tuned Gradient Boosting model (XGBoost/LightGBM) for maximum predictive power, given the complexity of alternative data patterns.
+Run unit tests:
+```bash
+pytest tests/ -v
+```
 
-2. **Interpretability Layer**: Use SHAP values and feature importance analysis to explain model decisions. Create scorecards or rule-based summaries that translate model outputs into business-friendly explanations.
+Run with coverage:
+```bash
+pytest tests/ -v --cov=src --cov-report=html
+```
 
-3. **Validation Model**: Maintain a Logistic Regression with WoE as a benchmark and validation tool. This provides a baseline and helps validate that the complex model's decisions align with business logic.
+## CI/CD Pipeline
 
-4. **Documentation**: Comprehensive documentation of:
-   - Feature engineering process
-   - Model selection rationale
-   - Validation results and performance metrics
-   - Business rules and thresholds
-   - Monitoring and recalibration procedures
+The GitHub Actions workflow automatically:
+- Runs code linting (flake8, black)
+- Executes unit tests
+- Builds and tests Docker image
 
-5. **Risk Governance**: Implement clear approval workflows, model monitoring dashboards, and regular validation cycles to satisfy regulatory requirements while leveraging model performance.
+The pipeline triggers on:
+- Push to `main` or `develop` branches
+- Pull requests to `main` or `develop`
 
-This approach balances regulatory compliance with predictive performance, ensuring the model is both effective and acceptable to regulators and business stakeholders.
+Build fails if linting or tests fail.
 
+## MLflow Tracking
+
+View experiment results:
+```bash
+mlflow ui --backend-store-uri file:./mlruns
+```
+
+Access MLflow UI at `http://localhost:5000`
+
+## Business Context
+
+This project addresses credit risk assessment for a buy-now-pay-later service using alternative data from eCommerce transactions. Since traditional credit history is unavailable, we:
+
+1. **Create Proxy Targets**: Use RFM (Recency, Frequency, Monetary) analysis and clustering to identify high-risk customer segments
+2. **Engineer Features**: Transform transactional data into predictive features
+3. **Train Models**: Build and compare multiple algorithms to find the best performer
+4. **Deploy**: Containerize the best model as a production-ready API
+
+The approach balances regulatory compliance (Basel II requirements) with predictive performance, using interpretable models where possible while leveraging advanced algorithms for accuracy.
+
+## License
+
+This project is part of an educational challenge and is provided as-is.
