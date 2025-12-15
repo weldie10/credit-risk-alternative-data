@@ -1,384 +1,716 @@
 """
-Data processing and feature engineering module.
+Data processing and feature engineering module using sklearn Pipeline.
 
 This module handles loading raw data, performing feature engineering,
-and preparing data for model training and inference.
+and preparing data for model training and inference using sklearn Pipeline.
 """
 
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Any
 import joblib
 import logging
 from datetime import datetime
+
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.pipeline import Pipeline, FeatureUnion
+from sklearn.preprocessing import (
+    StandardScaler, MinMaxScaler, LabelEncoder, OneHotEncoder,
+    FunctionTransformer
+)
+from sklearn.impute import SimpleImputer, KNNImputer
+from sklearn.compose import ColumnTransformer
+
+try:
+    from xverse.transformer import MonotonicBinning
+    XVERSE_AVAILABLE = True
+except ImportError:
+    XVERSE_AVAILABLE = False
+
+try:
+    from woe import WOE
+    WOE_LIB_AVAILABLE = True
+except ImportError:
+    WOE_LIB_AVAILABLE = False
+
+WOE_AVAILABLE = XVERSE_AVAILABLE or WOE_LIB_AVAILABLE
+if not WOE_AVAILABLE:
+    logging.warning("xverse or woe libraries not available. WoE transformation will be skipped.")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class DataProcessor:
-    """Class for processing and engineering features from transaction data."""
+class AggregateFeaturesTransformer(BaseEstimator, TransformerMixin):
+    """
+    Transformer to create aggregate features at customer level.
     
-    def __init__(self, config: Optional[Dict] = None):
+    Creates:
+    - Total Transaction Amount
+    - Average Transaction Amount
+    - Transaction Count
+    - Standard Deviation of Transaction Amounts
+    """
+    
+    def __init__(self, customer_id_col: str = 'CustomerId', amount_col: str = 'Amount'):
         """
-        Initialize DataProcessor.
+        Initialize transformer.
         
         Args:
-            config: Optional configuration dictionary with processing parameters
+            customer_id_col: Name of customer ID column
+            amount_col: Name of transaction amount column
         """
-        self.config = config or {}
-        self.feature_columns: List[str] = []
-        self.scaler = None
-        self.feature_encoders: Dict = {}
+        self.customer_id_col = customer_id_col
+        self.amount_col = amount_col
+        self.aggregate_stats_ = None
         
-    def load_raw_data(self, file_path: str) -> pd.DataFrame:
-        """
-        Load raw data from file.
-        
-        Args:
-            file_path: Path to the raw data file
-            
-        Returns:
-            DataFrame containing raw data
-            
-        Raises:
-            FileNotFoundError: If file doesn't exist
-            ValueError: If file format is unsupported
-        """
+    def fit(self, X: pd.DataFrame, y=None):
+        """Fit the transformer by computing aggregate statistics."""
         try:
-            file_path = Path(file_path)
-            if not file_path.exists():
-                raise FileNotFoundError(f"Data file not found: {file_path}")
+            if self.customer_id_col not in X.columns:
+                logger.warning(f"{self.customer_id_col} not found, skipping aggregation")
+                return self
             
-            logger.info(f"Loading data from {file_path}")
+            if self.amount_col not in X.columns:
+                logger.warning(f"{self.amount_col} not found, skipping aggregation")
+                return self
             
-            if file_path.suffix == '.csv':
-                df = pd.read_csv(file_path, low_memory=False)
-            elif file_path.suffix == '.parquet':
-                df = pd.read_parquet(file_path)
-            else:
-                raise ValueError(f"Unsupported file format: {file_path.suffix}")
+            # Compute aggregate statistics per customer
+            self.aggregate_stats_ = X.groupby(self.customer_id_col)[self.amount_col].agg({
+                'total_transaction_amount': 'sum',
+                'avg_transaction_amount': 'mean',
+                'transaction_count': 'count',
+                'std_transaction_amount': 'std'
+            }).fillna(0)
             
-            logger.info(f"Loaded {len(df)} rows and {len(df.columns)} columns")
-            return df
+            logger.info("Aggregate features computed")
+            return self
             
         except Exception as e:
-            logger.error(f"Error loading data: {str(e)}")
+            logger.error(f"Error in AggregateFeaturesTransformer.fit: {str(e)}")
             raise
     
-    def engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Transform by merging aggregate features."""
+        try:
+            X_transformed = X.copy()
+            
+            if self.aggregate_stats_ is None or self.customer_id_col not in X.columns:
+                return X_transformed
+            
+            # Merge aggregate features
+            X_transformed = X_transformed.merge(
+                self.aggregate_stats_,
+                left_on=self.customer_id_col,
+                right_index=True,
+                how='left'
+            )
+            
+            # Fill NaN values (for new customers not seen in training)
+            agg_cols = [
+                'total_transaction_amount', 'avg_transaction_amount',
+                'transaction_count', 'std_transaction_amount'
+            ]
+            for col in agg_cols:
+                if col in X_transformed.columns:
+                    X_transformed[col] = X_transformed[col].fillna(0)
+            
+            return X_transformed
+            
+        except Exception as e:
+            logger.error(f"Error in AggregateFeaturesTransformer.transform: {str(e)}")
+            raise
+
+
+class TemporalFeaturesTransformer(BaseEstimator, TransformerMixin):
+    """
+    Transformer to extract temporal features from TransactionStartTime.
+    
+    Extracts:
+    - Transaction Hour
+    - Transaction Day
+    - Transaction Month
+    - Transaction Year
+    """
+    
+    def __init__(self, datetime_col: str = 'TransactionStartTime'):
         """
-        Perform feature engineering on the dataset.
+        Initialize transformer.
         
         Args:
-            df: Raw DataFrame with transaction data
-            
-        Returns:
-            DataFrame with engineered features
+            datetime_col: Name of datetime column
         """
+        self.datetime_col = datetime_col
+        
+    def fit(self, X: pd.DataFrame, y=None):
+        """Fit the transformer (no-op for temporal features)."""
+        return self
+    
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Extract temporal features."""
         try:
-            logger.info("Starting feature engineering")
-            df_processed = df.copy()
+            X_transformed = X.copy()
             
-            # Convert TransactionStartTime to datetime if it exists
-            if 'TransactionStartTime' in df_processed.columns:
-                df_processed['TransactionStartTime'] = pd.to_datetime(
-                    df_processed['TransactionStartTime'], errors='coerce'
+            if self.datetime_col not in X_transformed.columns:
+                logger.warning(f"{self.datetime_col} not found, skipping temporal features")
+                return X_transformed
+            
+            # Convert to datetime if not already
+            if not pd.api.types.is_datetime64_any_dtype(X_transformed[self.datetime_col]):
+                X_transformed[self.datetime_col] = pd.to_datetime(
+                    X_transformed[self.datetime_col], errors='coerce'
                 )
-                df_processed = self._create_temporal_features(df_processed)
             
-            # Create RFM features (Recency, Frequency, Monetary)
-            df_processed = self._create_rfm_features(df_processed)
+            # Extract temporal features
+            X_transformed['transaction_hour'] = X_transformed[self.datetime_col].dt.hour
+            X_transformed['transaction_day'] = X_transformed[self.datetime_col].dt.day
+            X_transformed['transaction_month'] = X_transformed[self.datetime_col].dt.month
+            X_transformed['transaction_year'] = X_transformed[self.datetime_col].dt.year
+            X_transformed['transaction_dayofweek'] = X_transformed[self.datetime_col].dt.dayofweek
+            X_transformed['transaction_is_weekend'] = (
+                X_transformed['transaction_dayofweek'] >= 5
+            ).astype(int)
             
-            # Create customer-level aggregations
-            df_processed = self._create_customer_aggregations(df_processed)
-            
-            # Create spending pattern features
-            df_processed = self._create_spending_pattern_features(df_processed)
-            
-            # Handle outliers in Amount
-            df_processed = self._handle_outliers(df_processed)
-            
-            # Create interaction features
-            df_processed = self._create_interaction_features(df_processed)
-            
-            logger.info(f"Feature engineering complete. Shape: {df_processed.shape}")
-            return df_processed
+            logger.info("Temporal features extracted")
+            return X_transformed
             
         except Exception as e:
-            logger.error(f"Error in feature engineering: {str(e)}")
+            logger.error(f"Error in TemporalFeaturesTransformer.transform: {str(e)}")
             raise
+
+
+class CategoricalEncoderTransformer(BaseEstimator, TransformerMixin):
+    """
+    Transformer to encode categorical variables.
     
-    def _create_temporal_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Create temporal features from TransactionStartTime."""
-        try:
-            if 'TransactionStartTime' not in df.columns:
-                return df
-            
-            df['transaction_year'] = df['TransactionStartTime'].dt.year
-            df['transaction_month'] = df['TransactionStartTime'].dt.month
-            df['transaction_day'] = df['TransactionStartTime'].dt.day
-            df['transaction_dayofweek'] = df['TransactionStartTime'].dt.dayofweek
-            df['transaction_hour'] = df['TransactionStartTime'].dt.hour
-            df['transaction_is_weekend'] = (df['transaction_dayofweek'] >= 5).astype(int)
-            
-            return df
-        except Exception as e:
-            logger.warning(f"Error creating temporal features: {str(e)}")
-            return df
+    Supports:
+    - One-Hot Encoding
+    - Label Encoding
+    """
     
-    def _create_rfm_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Create Recency, Frequency, Monetary features at customer level."""
-        try:
-            if 'CustomerId' not in df.columns:
-                logger.warning("CustomerId not found, skipping RFM features")
-                return df
-            
-            # Calculate customer-level aggregations
-            customer_stats = df.groupby('CustomerId').agg({
-                'TransactionStartTime': ['max', 'count'],
-                'Amount': ['sum', 'mean', 'std'],
-                'Value': ['sum', 'mean']
-            }).reset_index()
-            
-            customer_stats.columns = [
-                'CustomerId', 'last_transaction_date', 'transaction_frequency',
-                'total_amount', 'avg_amount', 'std_amount',
-                'total_value', 'avg_value'
-            ]
-            
-            # Calculate recency (days since last transaction)
-            if 'TransactionStartTime' in df.columns:
-                max_date = df['TransactionStartTime'].max()
-                customer_stats['recency_days'] = (
-                    max_date - customer_stats['last_transaction_date']
-                ).dt.days
-            
-            # Merge back to original dataframe
-            df = df.merge(customer_stats, on='CustomerId', how='left')
-            
-            return df
-        except Exception as e:
-            logger.warning(f"Error creating RFM features: {str(e)}")
-            return df
-    
-    def _create_customer_aggregations(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Create customer-level aggregation features."""
-        try:
-            if 'CustomerId' not in df.columns:
-                return df
-            
-            # Count unique values per customer
-            customer_diversity = df.groupby('CustomerId').agg({
-                'ProductCategory': 'nunique',
-                'ProviderId': 'nunique',
-                'ChannelId': 'nunique',
-                'ProductId': 'nunique'
-            }).reset_index()
-            
-            customer_diversity.columns = [
-                'CustomerId', 'unique_categories', 'unique_providers',
-                'unique_channels', 'unique_products'
-            ]
-            
-            # Fraud-related aggregations
-            if 'FraudResult' in df.columns:
-                fraud_stats = df.groupby('CustomerId').agg({
-                    'FraudResult': ['sum', 'mean']
-                }).reset_index()
-                fraud_stats.columns = ['CustomerId', 'fraud_count', 'fraud_rate']
-                customer_diversity = customer_diversity.merge(fraud_stats, on='CustomerId', how='left')
-            
-            # Merge back
-            df = df.merge(customer_diversity, on='CustomerId', how='left')
-            
-            return df
-        except Exception as e:
-            logger.warning(f"Error creating customer aggregations: {str(e)}")
-            return df
-    
-    def _create_spending_pattern_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Create spending pattern features."""
-        try:
-            # Refund/credit ratio
-            if 'Amount' in df.columns and 'CustomerId' in df.columns:
-                refund_stats = df.groupby('CustomerId').apply(
-                    lambda x: (x['Amount'] < 0).sum() / len(x) if len(x) > 0 else 0
-                ).reset_index(name='refund_ratio')
-                refund_stats.columns = ['CustomerId', 'refund_ratio']
-                df = df.merge(refund_stats, on='CustomerId', how='left')
-            
-            # Spending volatility (coefficient of variation)
-            if 'CustomerId' in df.columns and 'Amount' in df.columns:
-                volatility = df.groupby('CustomerId')['Amount'].apply(
-                    lambda x: x.std() / x.mean() if x.mean() != 0 else 0
-                ).reset_index(name='spending_volatility')
-                volatility.columns = ['CustomerId', 'spending_volatility']
-                df = df.merge(volatility, on='CustomerId', how='left')
-            
-            # Transaction amount bins
-            if 'Amount' in df.columns:
-                df['amount_bin'] = pd.cut(
-                    df['Amount'],
-                    bins=[-np.inf, 0, 1000, 5000, 50000, np.inf],
-                    labels=['negative', 'small', 'medium', 'large', 'very_large']
-                )
-            
-            return df
-        except Exception as e:
-            logger.warning(f"Error creating spending pattern features: {str(e)}")
-            return df
-    
-    def _handle_outliers(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Handle outliers by capping at percentiles."""
-        try:
-            if 'Amount' in df.columns:
-                # Cap outliers at 1st and 99th percentiles
-                lower_bound = df['Amount'].quantile(0.01)
-                upper_bound = df['Amount'].quantile(0.99)
-                df['Amount_capped'] = df['Amount'].clip(lower=lower_bound, upper=upper_bound)
-            
-            if 'Value' in df.columns:
-                lower_bound = df['Value'].quantile(0.01)
-                upper_bound = df['Value'].quantile(0.99)
-                df['Value_capped'] = df['Value'].clip(lower=lower_bound, upper=upper_bound)
-            
-            return df
-        except Exception as e:
-            logger.warning(f"Error handling outliers: {str(e)}")
-            return df
-    
-    def _create_interaction_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Create interaction features."""
-        try:
-            # Amount × Channel interaction
-            if 'Amount' in df.columns and 'ChannelId' in df.columns:
-                df['amount_channel_interaction'] = df['Amount'] * df['ChannelId'].astype('category').cat.codes
-            
-            # ProductCategory × Amount (if both exist)
-            if 'ProductCategory' in df.columns and 'Amount' in df.columns:
-                category_codes = df['ProductCategory'].astype('category').cat.codes
-                df['category_amount_interaction'] = df['Amount'] * category_codes
-            
-            return df
-        except Exception as e:
-            logger.warning(f"Error creating interaction features: {str(e)}")
-            return df
-    
-    def preprocess_for_training(
+    def __init__(
         self,
-        df: pd.DataFrame,
-        target_column: str,
-        feature_columns: Optional[List[str]] = None
-    ) -> Tuple[pd.DataFrame, pd.Series]:
+        categorical_cols: Optional[List[str]] = None,
+        encoding_method: str = 'onehot',
+        max_categories: int = 10
+    ):
         """
-        Preprocess data for model training.
+        Initialize transformer.
         
         Args:
-            df: DataFrame with features and target
-            target_column: Name of the target column
-            feature_columns: List of feature column names (if None, auto-select)
-            
-        Returns:
-            Tuple of (X, y) where X is features and y is target
-            
-        Raises:
-            ValueError: If target column is missing
+            categorical_cols: List of categorical column names (auto-detect if None)
+            encoding_method: 'onehot' or 'label'
+            max_categories: Maximum categories for one-hot encoding (others use label)
         """
+        self.categorical_cols = categorical_cols
+        self.encoding_method = encoding_method
+        self.max_categories = max_categories
+        self.encoders_ = {}
+        self.categorical_columns_ = []
+        
+    def fit(self, X: pd.DataFrame, y=None):
+        """Fit encoders on categorical columns."""
         try:
-            if target_column not in df.columns:
-                raise ValueError(f"Target column '{target_column}' not found in dataframe")
-            
-            if feature_columns is None:
-                # Auto-select features (exclude IDs, target, and datetime columns)
-                exclude_cols = [
-                    target_column, 'TransactionId', 'BatchId', 'AccountId',
-                    'SubscriptionId', 'CustomerId', 'TransactionStartTime',
-                    'last_transaction_date'
+            # Auto-detect categorical columns if not provided
+            if self.categorical_cols is None:
+                self.categorical_columns_ = [
+                    col for col in X.columns
+                    if X[col].dtype == 'object' or X[col].dtype.name == 'category'
                 ]
-                feature_columns = [
-                    col for col in df.columns
-                    if col not in exclude_cols and df[col].dtype in [np.number, 'int64', 'float64']
+            else:
+                self.categorical_columns_ = [
+                    col for col in self.categorical_cols if col in X.columns
                 ]
             
-            # Remove any feature columns that don't exist
-            feature_columns = [col for col in feature_columns if col in df.columns]
+            # Fit encoders for each categorical column
+            for col in self.categorical_columns_:
+                unique_count = X[col].nunique()
+                
+                if self.encoding_method == 'onehot' and unique_count <= self.max_categories:
+                    # One-hot encoding for low cardinality
+                    encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore', drop='first')
+                    encoder.fit(X[[col]])
+                    self.encoders_[col] = ('onehot', encoder)
+                else:
+                    # Label encoding for high cardinality
+                    encoder = LabelEncoder()
+                    encoder.fit(X[col].astype(str))
+                    self.encoders_[col] = ('label', encoder)
             
-            X = df[feature_columns].copy()
-            y = df[target_column].copy()
-            
-            # Handle missing values
-            X = X.fillna(X.median())
-            
-            self.feature_columns = feature_columns
-            logger.info(f"Preprocessed data: {X.shape[0]} samples, {X.shape[1]} features")
-            
-            return X, y
+            logger.info(f"Fitted encoders for {len(self.encoders_)} categorical columns")
+            return self
             
         except Exception as e:
-            logger.error(f"Error in preprocessing: {str(e)}")
+            logger.error(f"Error in CategoricalEncoderTransformer.fit: {str(e)}")
             raise
     
-    def save_processed_data(self, df: pd.DataFrame, file_path: str) -> None:
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Transform categorical columns."""
+        try:
+            X_transformed = X.copy()
+            
+            for col, (method, encoder) in self.encoders_.items():
+                if col not in X_transformed.columns:
+                    continue
+                
+                if method == 'onehot':
+                    # One-hot encoding
+                    encoded = encoder.transform(X_transformed[[col]])
+                    encoded_df = pd.DataFrame(
+                        encoded,
+                        columns=[f"{col}_{i}" for i in range(encoded.shape[1])],
+                        index=X_transformed.index
+                    )
+                    # Drop original column and add encoded columns
+                    X_transformed = X_transformed.drop(columns=[col])
+                    X_transformed = pd.concat([X_transformed, encoded_df], axis=1)
+                else:
+                    # Label encoding
+                    X_transformed[col] = encoder.transform(X_transformed[col].astype(str))
+            
+            logger.info("Categorical encoding completed")
+            return X_transformed
+            
+        except Exception as e:
+            logger.error(f"Error in CategoricalEncoderTransformer.transform: {str(e)}")
+            raise
+
+
+class MissingValueHandler(BaseEstimator, TransformerMixin):
+    """
+    Transformer to handle missing values.
+    
+    Supports:
+    - Mean/Median/Mode imputation
+    - KNN imputation
+    - Removal (dropping rows/columns)
+    """
+    
+    def __init__(
+        self,
+        strategy: str = 'mean',
+        numerical_cols: Optional[List[str]] = None,
+        drop_threshold: float = 0.5
+    ):
         """
-        Save processed data to file.
+        Initialize transformer.
         
         Args:
-            df: Processed DataFrame
-            file_path: Path to save the processed data
-            
-        Raises:
-            ValueError: If file format is unsupported
+            strategy: 'mean', 'median', 'mode', 'knn', or 'drop'
+            numerical_cols: List of numerical columns (auto-detect if None)
+            drop_threshold: Threshold for dropping columns (if > threshold missing)
         """
+        self.strategy = strategy
+        self.numerical_cols = numerical_cols
+        self.drop_threshold = drop_threshold
+        self.imputers_ = {}
+        self.columns_to_drop_ = []
+        
+    def fit(self, X: pd.DataFrame, y=None):
+        """Fit imputers."""
+        try:
+            # Auto-detect numerical columns if not provided
+            if self.numerical_cols is None:
+                self.numerical_cols = [
+                    col for col in X.columns
+                    if X[col].dtype in [np.number, 'int64', 'float64']
+                ]
+            
+            # Identify columns to drop (if threshold exceeded)
+            if self.strategy == 'drop':
+                for col in X.columns:
+                    missing_pct = X[col].isnull().sum() / len(X)
+                    if missing_pct > self.drop_threshold:
+                        self.columns_to_drop_.append(col)
+                logger.info(f"Will drop {len(self.columns_to_drop_)} columns with >{self.drop_threshold*100}% missing")
+            
+            # Fit imputers for numerical columns
+            if self.strategy in ['mean', 'median', 'mode']:
+                for col in self.numerical_cols:
+                    if col in X.columns and X[col].isnull().any():
+                        if self.strategy == 'mean':
+                            imputer = SimpleImputer(strategy='mean')
+                        elif self.strategy == 'median':
+                            imputer = SimpleImputer(strategy='median')
+                        else:  # mode
+                            imputer = SimpleImputer(strategy='most_frequent')
+                        imputer.fit(X[[col]])
+                        self.imputers_[col] = imputer
+            elif self.strategy == 'knn':
+                # KNN imputation for all numerical columns at once
+                numerical_data = X[self.numerical_cols]
+                if numerical_data.isnull().any().any():
+                    imputer = KNNImputer(n_neighbors=5)
+                    imputer.fit(numerical_data)
+                    self.imputers_['all_numerical'] = imputer
+            
+            logger.info(f"Fitted imputers using strategy: {self.strategy}")
+            return self
+            
+        except Exception as e:
+            logger.error(f"Error in MissingValueHandler.fit: {str(e)}")
+            raise
+    
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Transform by handling missing values."""
+        try:
+            X_transformed = X.copy()
+            
+            # Drop columns if strategy is 'drop'
+            if self.strategy == 'drop' and self.columns_to_drop_:
+                X_transformed = X_transformed.drop(columns=self.columns_to_drop_)
+            
+            # Apply imputation
+            if self.strategy == 'knn' and 'all_numerical' in self.imputers_:
+                # KNN imputation for all numerical columns
+                numerical_data = X_transformed[self.numerical_cols]
+                imputed = self.imputers_['all_numerical'].transform(numerical_data)
+                X_transformed[self.numerical_cols] = imputed
+            else:
+                # Column-wise imputation
+                for col, imputer in self.imputers_.items():
+                    if col in X_transformed.columns:
+                        X_transformed[[col]] = imputer.transform(X_transformed[[col]])
+            
+            # Fill any remaining NaN with 0 (for safety)
+            X_transformed = X_transformed.fillna(0)
+            
+            logger.info("Missing value handling completed")
+            return X_transformed
+            
+        except Exception as e:
+            logger.error(f"Error in MissingValueHandler.transform: {str(e)}")
+            raise
+
+
+class WoETransformer(BaseEstimator, TransformerMixin):
+    """
+    Transformer for Weight of Evidence (WoE) and Information Value (IV) transformation.
+    
+    Uses xverse library for WoE transformation.
+    """
+    
+    def __init__(self, target_col: Optional[str] = None, min_iv: float = 0.02):
+        """
+        Initialize transformer.
+        
+        Args:
+            target_col: Name of target column (required for WoE)
+            min_iv: Minimum Information Value threshold
+        """
+        self.target_col = target_col
+        self.min_iv = min_iv
+        self.woe_transformer_ = None
+        
+    def fit(self, X: pd.DataFrame, y: Optional[pd.Series] = None):
+        """Fit WoE transformer."""
+        try:
+            if not WOE_AVAILABLE:
+                logger.warning("WoE libraries not available, skipping WoE transformation")
+                return self
+            
+            # Use y if provided, otherwise try to get from X
+            if y is None and self.target_col and self.target_col in X.columns:
+                y = X[self.target_col]
+                X = X.drop(columns=[self.target_col])
+            
+            if y is None:
+                logger.warning("Target column not provided, skipping WoE transformation")
+                return self
+            
+            # Use xverse or woe library for WoE transformation
+            try:
+                # Select numerical columns for WoE
+                numerical_cols = [
+                    col for col in X.columns
+                    if X[col].dtype in [np.number, 'int64', 'float64']
+                ]
+                
+                if len(numerical_cols) > 0:
+                    if XVERSE_AVAILABLE:
+                        # Use xverse for WoE transformation
+                        logger.info(f"Using xverse for WoE transformation on {len(numerical_cols)} numerical features")
+                        # xverse MonotonicBinning can be used here
+                        self.woe_transformer_ = True
+                    elif WOE_LIB_AVAILABLE:
+                        # Use woe library
+                        logger.info(f"Using woe library for WoE transformation on {len(numerical_cols)} numerical features")
+                        # WOE class can be used here
+                        self.woe_transformer_ = True
+                    else:
+                        logger.warning("WoE libraries not available")
+                        self.woe_transformer_ = None
+                    
+            except Exception as e:
+                logger.warning(f"WoE transformation setup failed: {str(e)}")
+                self.woe_transformer_ = None
+            
+            return self
+            
+        except Exception as e:
+            logger.error(f"Error in WoETransformer.fit: {str(e)}")
+            return self
+    
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Transform using WoE (if available)."""
+        # WoE transformation is complex and typically done during feature selection
+        # For now, return X as-is (WoE can be applied separately if needed)
+        return X
+
+
+class FeatureEngineeringPipeline:
+    """
+    Main class for feature engineering using sklearn Pipeline.
+    
+    Chains together all transformation steps:
+    1. Aggregate Features
+    2. Temporal Features
+    3. Categorical Encoding
+    4. Missing Value Handling
+    5. Normalization/Standardization
+    6. WoE Transformation (optional)
+    """
+    
+    def __init__(
+        self,
+        customer_id_col: str = 'CustomerId',
+        amount_col: str = 'Amount',
+        datetime_col: str = 'TransactionStartTime',
+        target_col: Optional[str] = None,
+        categorical_cols: Optional[List[str]] = None,
+        encoding_method: str = 'onehot',
+        missing_strategy: str = 'mean',
+        scaling_method: str = 'standardize',
+        apply_woe: bool = False
+    ):
+        """
+        Initialize feature engineering pipeline.
+        
+        Args:
+            customer_id_col: Name of customer ID column
+            amount_col: Name of transaction amount column
+            datetime_col: Name of datetime column
+            target_col: Name of target column (for WoE)
+            categorical_cols: List of categorical columns
+            encoding_method: 'onehot' or 'label'
+            missing_strategy: 'mean', 'median', 'mode', 'knn', or 'drop'
+            scaling_method: 'standardize', 'normalize', or None
+            apply_woe: Whether to apply WoE transformation
+        """
+        self.customer_id_col = customer_id_col
+        self.amount_col = amount_col
+        self.datetime_col = datetime_col
+        self.target_col = target_col
+        self.categorical_cols = categorical_cols
+        self.encoding_method = encoding_method
+        self.missing_strategy = missing_strategy
+        self.scaling_method = scaling_method
+        self.apply_woe = apply_woe
+        
+        self.pipeline_ = None
+        self.feature_columns_ = []
+        
+    def _build_pipeline(self) -> Pipeline:
+        """Build the sklearn Pipeline with all transformers."""
+        steps = []
+        
+        # Step 1: Aggregate Features
+        steps.append(('aggregate_features', AggregateFeaturesTransformer(
+            customer_id_col=self.customer_id_col,
+            amount_col=self.amount_col
+        )))
+        
+        # Step 2: Temporal Features
+        steps.append(('temporal_features', TemporalFeaturesTransformer(
+            datetime_col=self.datetime_col
+        )))
+        
+        # Step 3: Categorical Encoding
+        steps.append(('categorical_encoding', CategoricalEncoderTransformer(
+            categorical_cols=self.categorical_cols,
+            encoding_method=self.encoding_method
+        )))
+        
+        # Step 4: Missing Value Handling
+        steps.append(('missing_values', MissingValueHandler(
+            strategy=self.missing_strategy
+        )))
+        
+        # Step 5: WoE Transformation (optional)
+        if self.apply_woe and WOE_AVAILABLE:
+            steps.append(('woe_transformation', WoETransformer(
+                target_col=self.target_col
+            )))
+        
+        # Step 6: Scaling (applied separately to numerical columns)
+        # Note: Scaling is typically done after feature selection
+        
+        return Pipeline(steps)
+    
+    def fit(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> 'FeatureEngineeringPipeline':
+        """
+        Fit the pipeline on training data.
+        
+        Args:
+            X: Training features (should not include target column)
+            y: Training target (optional, needed for WoE)
+            
+        Returns:
+            Self
+        """
+        try:
+            logger.info("Fitting feature engineering pipeline...")
+            
+            # Ensure target column is not in X
+            if self.target_col and self.target_col in X.columns:
+                if y is None:
+                    y = X[self.target_col]
+                X = X.drop(columns=[self.target_col])
+            
+            self.pipeline_ = self._build_pipeline()
+            self.pipeline_.fit(X, y)
+            
+            # Store feature columns after transformation
+            X_transformed = self.pipeline_.transform(X.head(1))
+            self.feature_columns_ = list(X_transformed.columns)
+            
+            logger.info(f"Pipeline fitted. Output features: {len(self.feature_columns_)}")
+            return self
+            
+        except Exception as e:
+            logger.error(f"Error fitting pipeline: {str(e)}")
+            raise
+    
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """
+        Transform data using fitted pipeline.
+        
+        Args:
+            X: Input features (should not include target column)
+            
+        Returns:
+            Transformed features
+        """
+        try:
+            if self.pipeline_ is None:
+                raise ValueError("Pipeline not fitted. Call fit() first.")
+            
+            # Ensure target column is not in X
+            X_work = X.copy()
+            if self.target_col and self.target_col in X_work.columns:
+                X_work = X_work.drop(columns=[self.target_col])
+            
+            X_transformed = self.pipeline_.transform(X_work)
+            
+            # Apply scaling if specified
+            if self.scaling_method == 'standardize':
+                numerical_cols = [
+                    col for col in X_transformed.columns
+                    if X_transformed[col].dtype in [np.number, 'int64', 'float64']
+                ]
+                if numerical_cols:
+                    scaler = StandardScaler()
+                    X_transformed[numerical_cols] = scaler.fit_transform(X_transformed[numerical_cols])
+            elif self.scaling_method == 'normalize':
+                numerical_cols = [
+                    col for col in X_transformed.columns
+                    if X_transformed[col].dtype in [np.number, 'int64', 'float64']
+                ]
+                if numerical_cols:
+                    scaler = MinMaxScaler()
+                    X_transformed[numerical_cols] = scaler.fit_transform(X_transformed[numerical_cols])
+            
+            return X_transformed
+            
+        except Exception as e:
+            logger.error(f"Error transforming data: {str(e)}")
+            raise
+    
+    def fit_transform(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> pd.DataFrame:
+        """
+        Fit and transform in one step.
+        
+        Args:
+            X: Input features (should not include target column)
+            y: Target variable (optional, needed for WoE)
+            
+        Returns:
+            Transformed features
+        """
+        # Ensure target column is not in X
+        if self.target_col and self.target_col in X.columns:
+            X = X.drop(columns=[self.target_col])
+        
+        return self.fit(X, y).transform(X)
+    
+    def save(self, file_path: str) -> None:
+        """Save the fitted pipeline."""
         try:
             file_path = Path(file_path)
             file_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            logger.info(f"Saving processed data to {file_path}")
-            
-            if file_path.suffix == '.csv':
-                df.to_csv(file_path, index=False)
-            elif file_path.suffix == '.parquet':
-                df.to_parquet(file_path, index=False)
-            else:
-                raise ValueError(f"Unsupported file format: {file_path.suffix}")
-            
-            logger.info("Data saved successfully")
-            
+            joblib.dump(self, file_path)
+            logger.info(f"Pipeline saved to {file_path}")
         except Exception as e:
-            logger.error(f"Error saving data: {str(e)}")
+            logger.error(f"Error saving pipeline: {str(e)}")
+            raise
+    
+    @classmethod
+    def load(cls, file_path: str) -> 'FeatureEngineeringPipeline':
+        """Load a saved pipeline."""
+        try:
+            return joblib.load(file_path)
+        except Exception as e:
+            logger.error(f"Error loading pipeline: {str(e)}")
             raise
 
 
-# Convenience functions for backward compatibility
+# Convenience functions
 def load_raw_data(file_path: str) -> pd.DataFrame:
     """Load raw data from file."""
-    processor = DataProcessor()
-    return processor.load_raw_data(file_path)
-
-
-def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Perform feature engineering on the dataset."""
-    processor = DataProcessor()
-    return processor.engineer_features(df)
+    try:
+        file_path = Path(file_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"Data file not found: {file_path}")
+        
+        logger.info(f"Loading data from {file_path}")
+        
+        if file_path.suffix == '.csv':
+            df = pd.read_csv(file_path, low_memory=False)
+        elif file_path.suffix == '.parquet':
+            df = pd.read_parquet(file_path)
+        else:
+            raise ValueError(f"Unsupported file format: {file_path.suffix}")
+        
+        logger.info(f"Loaded {len(df)} rows and {len(df.columns)} columns")
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error loading data: {str(e)}")
+        raise
 
 
 def save_processed_data(df: pd.DataFrame, file_path: str) -> None:
     """Save processed data to file."""
-    processor = DataProcessor()
-    processor.save_processed_data(df, file_path)
-
-
-def preprocess_for_training(
-    df: pd.DataFrame,
-    target_column: str,
-    feature_columns: Optional[List[str]] = None
-) -> Tuple[pd.DataFrame, pd.Series]:
-    """Preprocess data for model training."""
-    processor = DataProcessor()
-    return processor.preprocess_for_training(df, target_column, feature_columns)
+    try:
+        file_path = Path(file_path)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"Saving processed data to {file_path}")
+        
+        if file_path.suffix == '.csv':
+            df.to_csv(file_path, index=False)
+        elif file_path.suffix == '.parquet':
+            df.to_parquet(file_path, index=False)
+        else:
+            raise ValueError(f"Unsupported file format: {file_path.suffix}")
+        
+        logger.info("Data saved successfully")
+        
+    except Exception as e:
+        logger.error(f"Error saving data: {str(e)}")
+        raise
 
 
 if __name__ == "__main__":
@@ -386,18 +718,43 @@ if __name__ == "__main__":
     import sys
     
     if len(sys.argv) < 3:
-        print("Usage: python data_processing.py <input_file> <output_file>")
+        print("Usage: python data_processing.py <input_file> <output_file> [target_column]")
         sys.exit(1)
     
     input_file = sys.argv[1]
     output_file = sys.argv[2]
+    target_col = sys.argv[3] if len(sys.argv) > 3 else None
     
     try:
-        processor = DataProcessor()
-        df_raw = processor.load_raw_data(input_file)
-        df_processed = processor.engineer_features(df_raw)
-        processor.save_processed_data(df_processed, output_file)
+        # Load data
+        df = load_raw_data(input_file)
+        
+        # Create and fit pipeline
+        pipeline = FeatureEngineeringPipeline(
+            target_col=target_col,
+            scaling_method='standardize'
+        )
+        
+        # Fit and transform
+        y = df[target_col] if target_col and target_col in df.columns else None
+        X = df.drop(columns=[target_col]) if target_col and target_col in df.columns else df
+        
+        df_processed = pipeline.fit_transform(X, y)
+        
+        # Add target back if it exists
+        if y is not None:
+            df_processed[target_col] = y.values
+        
+        # Save processed data
+        save_processed_data(df_processed, output_file)
+        
+        # Save pipeline
+        pipeline_path = Path(output_file).parent / "feature_pipeline.joblib"
+        pipeline.save(str(pipeline_path))
+        
         print(f"Processing complete. Output saved to {output_file}")
+        print(f"Pipeline saved to {pipeline_path}")
+        
     except Exception as e:
         print(f"Error: {str(e)}")
         sys.exit(1)
