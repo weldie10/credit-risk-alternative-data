@@ -13,6 +13,10 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - ENVIRONMENT=production
+      - MLFLOW_TRACKING_URI=file:./mlruns
+      - MLFLOW_MODEL_NAME=credit-risk-model
+      - MLFLOW_MODEL_STAGE=Production
+      - PORT=8000
     volumes:
       - ./models:/app/models:ro  # Mount models directory (read-only)
       - ./data:/app/data:ro      # Mount data directory (read-only)
